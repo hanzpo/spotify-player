@@ -51,7 +51,20 @@ pub struct AppClient {
     /// The user-provided Spotify client, mainly used for interacting with Spotify Web APIs
     user_client: Option<rspotify::AuthCodePkceSpotify>,
     #[cfg(feature = "streaming")]
-    stream_conn: Arc<Mutex<Option<librespot_connect::Spirc>>>,
+    stream_conn: Arc<Mutex<Option<StreamConn>>>,
+    /// Channel used to enqueue client requests from anywhere in the app.
+    /// Used by the streaming watcher to auto-restart the integrated client when
+    /// the librespot session dies unexpectedly.
+    pub client_pub: flume::Sender<ClientRequest>,
+}
+
+/// A live streaming connection. Bundles the `Spirc` handle with an oneshot
+/// sender used to mark intentional shutdowns so the auto-restart watcher can
+/// distinguish "we tore this down" from "the session died on us".
+#[cfg(feature = "streaming")]
+pub struct StreamConn {
+    pub spirc: librespot_connect::Spirc,
+    pub intentional_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Deref for AppClient {
@@ -65,7 +78,7 @@ impl Deref for AppClient {
 
 impl AppClient {
     /// Construct a new client
-    pub async fn new() -> Result<Self> {
+    pub async fn new(client_pub: flume::Sender<ClientRequest>) -> Result<Self> {
         let configs = config::get_config();
         let auth_config = AuthConfig::new(configs)?;
 
@@ -108,6 +121,8 @@ impl AppClient {
 
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(Mutex::new(None)),
+
+            client_pub,
         })
     }
 
@@ -124,60 +139,74 @@ impl AppClient {
             .clone())
     }
 
-    /// Initialize the application's playback upon creating a new session or during startup
+    /// Initialize the application's playback upon creating a new session or
+    /// during startup. Fire-and-forget; the loop runs for ~5 seconds in the
+    /// background.
     pub fn initialize_playback(&self, state: &SharedState) {
-        tokio::task::spawn({
-            let client = self.clone();
-            let state = state.clone();
-            async move {
-                // The main playback initialization logic is simple:
-                // if there is no playback, connect to an available device
-                //
-                // However, because it takes time for Spotify server to show up new changes,
-                // a retry logic is implemented to ensure the application's state is properly initialized
-                let delay = std::time::Duration::from_secs(1);
-
-                for _ in 0..5 {
-                    tokio::time::sleep(delay).await;
-
-                    if let Err(err) = client.retrieve_current_playback(&state, false).await {
-                        tracing::error!("Failed to retrieve current playback: {err:#}");
-                        return;
-                    }
-
-                    // if playback exists, don't connect to a new device
-                    if state.player.read().playback.is_some() {
-                        continue;
-                    }
-
-                    let id = match client.find_available_device().await {
-                        Ok(Some(id)) => Some(Cow::Owned(id)),
-                        Ok(None) => None,
-                        Err(err) => {
-                            tracing::error!("Failed to find an available device: {err:#}");
-                            None
-                        }
-                    };
-
-                    if let Some(id) = id {
-                        tracing::info!("Trying to connect to device (id={id})");
-                        if let Err(err) = client.transfer_playback(&id, Some(false)).await {
-                            tracing::warn!("Connection failed (device_id={id}): {err:#}");
-                        } else {
-                            tracing::info!("Connection succeeded (device_id={id})!");
-                            // upon new connection, reset the buffered playback
-                            state.player.write().buffered_playback = None;
-                            client.update_playback(&state);
-                            break;
-                        }
-                    }
-                }
-            }
+        let client = self.clone();
+        let state = state.clone();
+        tokio::task::spawn(async move {
+            run_initialize_playback(&client, &state).await;
         });
     }
 
-    /// Create a new client session
+    /// Awaitable variant of [`AppClient::initialize_playback`]. Used by the
+    /// integrated-client auto-restart path so we can synchronously wait for
+    /// the device to be re-registered before sending follow-up commands like
+    /// Resume.
+    pub async fn initialize_playback_now(&self, state: &SharedState) {
+        run_initialize_playback(self, state).await;
+    }
+
+    /// Restart the integrated client (full session rebuild). If `resume` is
+    /// true and we were playing before the death, fire a Resume once the new
+    /// session has settled — this is what the auto-restart watcher uses to
+    /// preserve playback through session-death events.
+    #[cfg(feature = "streaming")]
+    pub async fn restart_integrated_client(
+        &self,
+        state: &SharedState,
+        resume: bool,
+    ) -> Result<()> {
+        // Don't let new_session's fire-and-forget initialize race against our
+        // synchronous initialize below.
+        self.new_session_inner(Some(state), false, false).await?;
+        self.initialize_playback_now(state).await;
+
+        if resume {
+            let playback = state.player.read().buffered_playback.clone();
+            // handle_player_request returns the updated metadata; we don't
+            // need to thread it back through state — update_playback will
+            // refresh on the next tick.
+            if let Err(err) = self
+                .handle_player_request(PlayerRequest::Resume, playback)
+                .await
+            {
+                tracing::error!("Failed to resume after auto-restart: {err:#}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a new client session.
+    ///
+    /// Spawns `initialize_playback` as a background task. Most callers want
+    /// this fire-and-forget behavior; callers that need to synchronously
+    /// wait for the device to be registered (e.g. the auto-restart path)
+    /// should use [`AppClient::new_session_inner`] with `auto_init = false`
+    /// and call [`AppClient::initialize_playback_now`] themselves.
     pub async fn new_session(&self, state: Option<&SharedState>, reauth: bool) -> Result<()> {
+        self.new_session_inner(state, reauth, true).await
+    }
+
+    /// Inner implementation of [`AppClient::new_session`]. `auto_init`
+    /// controls whether `initialize_playback` is spawned at the end.
+    async fn new_session_inner(
+        &self,
+        state: Option<&SharedState>,
+        reauth: bool,
+        auto_init: bool,
+    ) -> Result<()> {
         let session = self.auth_config.session();
         let creds = auth::get_creds(&self.auth_config, reauth, true).context("get credentials")?;
         self.spotify.set_session(session.clone()).await;
@@ -210,7 +239,9 @@ impl AppClient {
         if let Some(state) = state {
             // reset the application's caches
             state.data.write().caches = MemoryCaches::new();
-            self.initialize_playback(state);
+            if auto_init {
+                self.initialize_playback(state);
+            }
         }
 
         Ok(())
@@ -239,8 +270,13 @@ impl AppClient {
             crate::streaming::new_connection(self.clone(), state, session, creds).await?;
         let mut stream_conn = self.stream_conn.lock();
         // shutdown old streaming connection and replace it with a new connection
-        if let Some(conn) = stream_conn.as_ref() {
-            if let Err(err) = conn.shutdown() {
+        if let Some(mut conn) = stream_conn.take() {
+            // Signal the auto-restart watcher that this shutdown is intentional,
+            // so it doesn't loop us back through RestartIntegratedClient.
+            if let Some(tx) = conn.intentional_shutdown.take() {
+                let _ = tx.send(());
+            }
+            if let Err(err) = conn.spirc.shutdown() {
                 log::error!("Failed to shutdown old streaming connection: {err:#}");
             }
         }
@@ -392,8 +428,8 @@ impl AppClient {
                 }
             }
             #[cfg(feature = "streaming")]
-            ClientRequest::RestartIntegratedClient => {
-                self.new_session(Some(state), false).await?;
+            ClientRequest::RestartIntegratedClient { resume } => {
+                self.restart_integrated_client(state, resume).await?;
             }
             ClientRequest::GetCurrentUser => {
                 let user = self.current_user().await?;
@@ -1972,6 +2008,51 @@ impl AppClient {
 fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
     tracks.retain(|track| track.id != seed_track.id);
     tracks.insert(0, seed_track);
+}
+
+/// Shared implementation of `initialize_playback` and `initialize_playback_now`.
+///
+/// Polls Spotify for ~5s, looking for an existing playback session. If none is
+/// found, transfers playback to the first available device. The early `break`
+/// on successful transfer means the typical happy-path completes in 1-2s.
+async fn run_initialize_playback(client: &AppClient, state: &SharedState) {
+    let delay = std::time::Duration::from_secs(1);
+
+    for _ in 0..5 {
+        tokio::time::sleep(delay).await;
+
+        if let Err(err) = client.retrieve_current_playback(state, false).await {
+            tracing::error!("Failed to retrieve current playback: {err:#}");
+            return;
+        }
+
+        // if playback exists, don't connect to a new device
+        if state.player.read().playback.is_some() {
+            continue;
+        }
+
+        let id = match client.find_available_device().await {
+            Ok(Some(id)) => Some(Cow::Owned(id)),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::error!("Failed to find an available device: {err:#}");
+                None
+            }
+        };
+
+        if let Some(id) = id {
+            tracing::info!("Trying to connect to device (id={id})");
+            if let Err(err) = client.transfer_playback(&id, Some(false)).await {
+                tracing::warn!("Connection failed (device_id={id}): {err:#}");
+            } else {
+                tracing::info!("Connection succeeded (device_id={id})!");
+                // upon new connection, reset the buffered playback
+                state.player.write().buffered_playback = None;
+                client.update_playback(state);
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

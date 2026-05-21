@@ -1,4 +1,8 @@
-use crate::{client::AppClient, config, state::SharedState};
+use crate::{
+    client::{AppClient, ClientRequest, StreamConn},
+    config,
+    state::SharedState,
+};
 use anyhow::Context;
 use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
@@ -145,7 +149,7 @@ pub async fn new_connection(
     state: SharedState,
     session: Session,
     creds: Credentials,
-) -> anyhow::Result<Spirc> {
+) -> anyhow::Result<StreamConn> {
     let configs = config::get_config();
     let device = &configs.app_config.device;
 
@@ -216,6 +220,8 @@ pub async fn new_connection(
 
     let player_event_task = tokio::task::spawn({
         let mut channel = player.get_player_event_channel();
+        let client = client.clone();
+        let state = state.clone();
         async move {
             while let Some(event) = channel.recv().await {
                 match PlayerEvent::from_librespot_player_event(event) {
@@ -268,14 +274,69 @@ pub async fn new_connection(
         .await
         .context("initialize spirc")?;
 
-    tokio::task::spawn(async move {
-        tokio::select! {
-            () = spirc_task => {},
-            _ = player_event_task => {}
+    // Auto-restart on unexpected session death.
+    //
+    // librespot's `Session` is single-use: once the Spotify access-point closes
+    // the connection (which happens periodically, more often when the audio
+    // thread stalls on flaky Bluetooth devices), `spirc_task` completes and the
+    // integrated client is dead. Without this watcher, the only way to recover
+    // is for the user to press `R` (RestartIntegratedClient). We replicate that
+    // automatically by sending the same request when the task ends.
+    //
+    // We distinguish unexpected deaths from intentional shutdowns (e.g. when
+    // `new_streaming_connection` is replacing us) via the oneshot below.
+    let (intentional_shutdown_tx, intentional_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+
+    tokio::task::spawn({
+        let client = client.clone();
+        let state = state.clone();
+        async move {
+            // Snapshot whether the user was actively playing before the
+            // session died. We use this to decide whether to issue a Resume
+            // after the auto-restart finishes — otherwise Spotify reconnects
+            // in a paused state and the user has to hit space.
+            let was_playing = state
+                .player
+                .read()
+                .buffered_playback
+                .as_ref()
+                .is_some_and(|p| p.is_playing);
+
+            let restart_needed = tokio::select! {
+                () = spirc_task => true,
+                _ = intentional_shutdown_rx => false,
+            };
+
+            // player_event_task is allowed to outlive us briefly; it
+            // terminates on its own when the Player drops.
+            player_event_task.abort();
+
+            if restart_needed {
+                tracing::warn!(
+                    "Integrated client session ended unexpectedly; requesting auto-restart (was_playing={was_playing})"
+                );
+                // Small backoff so we don't hammer Spotify if it's unreachable.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Err(err) = client
+                    .client_pub
+                    .send_async(ClientRequest::RestartIntegratedClient {
+                        resume: was_playing,
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to enqueue auto-restart request: {err:#}");
+                }
+            } else {
+                tracing::info!("Integrated client shut down intentionally");
+            }
         }
     });
 
     tracing::info!("New streaming connection has been established!");
 
-    Ok(spirc)
+    Ok(StreamConn {
+        spirc,
+        intentional_shutdown: Some(intentional_shutdown_tx),
+    })
 }

@@ -156,9 +156,12 @@ fn try_connect_to_client(socket: &UdpSocket, configs: &config::Configs) -> Resul
 
             let rt = tokio::runtime::Runtime::new()?;
 
-            // create a Spotify API client
+            // create a Spotify API client.
+            // For the CLI fallback path there's no long-lived event loop, so
+            // any auto-restart requests from the streaming watcher are dropped.
+            let (client_pub, _client_sub) = flume::unbounded::<client::ClientRequest>();
             let client = rt
-                .block_on(client::AppClient::new())
+                .block_on(client::AppClient::new(client_pub))
                 .context("construct app client")?;
             rt.block_on(client.new_session(None, false))
                 .context("new session")?;

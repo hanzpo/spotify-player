@@ -52,7 +52,12 @@ pub enum ClientRequest {
         track_id: TrackId<'static>,
     },
     #[cfg(feature = "streaming")]
-    RestartIntegratedClient,
+    RestartIntegratedClient {
+        /// If true, send a Resume after the new session is fully ready.
+        /// Used by the auto-restart watcher to preserve playback through
+        /// session deaths. The manual `R` key passes false.
+        resume: bool,
+    },
     CreatePlaylist {
         playlist_name: String,
         public: bool,

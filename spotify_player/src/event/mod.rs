@@ -838,7 +838,10 @@ fn handle_global_command(
         }
         #[cfg(feature = "streaming")]
         Command::RestartIntegratedClient => {
-            client_pub.send(ClientRequest::RestartIntegratedClient)?;
+            // Manual `R` key — preserve historical behavior of leaving the
+            // session paused after restart. The auto-restart watcher passes
+            // resume=true when it triggers a restart on session death.
+            client_pub.send(ClientRequest::RestartIntegratedClient { resume: false })?;
         }
         Command::FocusNextWindow => {
             if !ui.has_focused_popup() {
