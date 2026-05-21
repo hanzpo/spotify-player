@@ -2012,23 +2012,33 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 
 /// Shared implementation of `initialize_playback` and `initialize_playback_now`.
 ///
-/// Polls Spotify for ~5s, looking for an existing playback session. If none is
-/// found, transfers playback to the first available device. The early `break`
-/// on successful transfer means the typical happy-path completes in 1-2s.
+/// Probes Spotify for an existing playback session and, if none is found,
+/// transfers playback to the first available device. The first probe runs
+/// immediately; subsequent retries are 1s apart, up to ~4s total. Exits
+/// early whenever the goal is reached (existing playback found, or transfer
+/// to a discovered device succeeded).
 async fn run_initialize_playback(client: &AppClient, state: &SharedState) {
     let delay = std::time::Duration::from_secs(1);
 
-    for _ in 0..5 {
-        tokio::time::sleep(delay).await;
+    for attempt in 0..5 {
+        // Sleep between iterations, but not before the first one — the
+        // device often comes back immediately when restarting an integrated
+        // client, and waiting a full second up front adds latency to every
+        // restart.
+        if attempt > 0 {
+            tokio::time::sleep(delay).await;
+        }
 
         if let Err(err) = client.retrieve_current_playback(state, false).await {
             tracing::error!("Failed to retrieve current playback: {err:#}");
             return;
         }
 
-        // if playback exists, don't connect to a new device
+        // If Spotify already reports an active playback session, we're
+        // done — there's nothing to set up. Caller can issue follow-up
+        // commands (Resume, etc.) against the existing device.
         if state.player.read().playback.is_some() {
-            continue;
+            break;
         }
 
         let id = match client.find_available_device().await {

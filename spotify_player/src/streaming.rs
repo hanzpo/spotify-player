@@ -317,7 +317,7 @@ pub async fn new_connection(
                     "Integrated client session ended unexpectedly; requesting auto-restart (was_playing={was_playing})"
                 );
                 // Small backoff so we don't hammer Spotify if it's unreachable.
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 if let Err(err) = client
                     .client_pub
                     .send_async(ClientRequest::RestartIntegratedClient {
